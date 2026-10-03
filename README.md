@@ -1,138 +1,187 @@
-# AI Firewall — a document-grounded assistant with a built-in security firewall
+# AI Firewall
 
-A sellable, end-to-end product: real accounts, a real LLM (Gemini) generating
-**grounded, cited** answers from a document a customer uploads, a security
-firewall on both the input and the output, and an admin dashboard that proves
-what the firewall blocked.
+A document-grounded assistant with a security firewall on every layer. Upload a
+document — an insurance policy, a certificate, a contract — and ask questions
+about it. The assistant answers **only** from that document, cites where each
+answer came from, refuses jailbreaks and prompt-injection attempts, and logs
+every decision so it can be audited.
 
-Runs fully without an API key (degrades to showing the top retrieved passage),
-so a live demo never hard-fails — but set `GEMINI_API_KEY` for the real thing.
-
----
-
-## What's new in this version
-
-Beyond the original pipeline, this build adds the four things that turn a
-prototype into something you'd put in front of a customer:
-
-| Feature | Where | Why it matters to a buyer |
-|---|---|---|
-| **Grounded answers with citations** | `src/llm.py`, `/` chat | Every answer sentence is tagged with the source passage it came from ([1], [2]). A customer can audit *why* the assistant said something — the #1 trust requirement for document AI. |
-| **Native PDF answering** | `src/llm.py` (`pdf_bytes`) | Scanned documents (like the sample certificate) have a garbled text layer. Instead of relying on broken OCR text, the actual PDF is sent to the model. This is the robust fix for the real-world scanned-doc case. |
-| **Abstention / relevance floor** | `src/llm.py`, `src/pipeline.py` | If nothing relevant was retrieved, the assistant says "I don't have that information" instead of returning a confidently-wrong chunk. A wrong answer costs more than an honest miss. |
-| **Audit log + admin dashboard** | `src/audit_log.py`, `/admin` | Every query, decision, latency, and block is logged. The dashboard rolls this into live metrics (threats blocked, out-of-domain rate, avg latency) — the evidence a security team needs. |
-
-Plus the retrieval fixes from the debugging pass: custom KBs now chunk small
-(45 words) so a short document is searchable per-question, and the relevance
-floor uses cosine (stable) rather than BM25 rerank score (goes negative on
-short corpora).
+Built to be run by anyone: clone it, add an API key, and it works end to end.
+Without a key it still runs (it returns the best retrieved passage instead of a
+generated answer), so a demo never hard-fails.
 
 ---
+
+## What it does
+
+- **Grounded, cited answers.** Every answer is drawn only from the uploaded
+  document and tagged with the passage it came from. No outside knowledge, no
+  hallucinated facts.
+- **A firewall on input and output.** Jailbreaks, prompt injection, and PII are
+  caught before they reach the model, and the model's own output is scanned
+  before it reaches the user. Agent tool-calls go through a separate action
+  firewall (argument inspection + dangerous-sequence detection).
+- **Honest abstention.** If the answer isn't in the document, it says so rather
+  than guessing.
+- **A visible, editable knowledge base.** See the exact text the assistant uses,
+  edit any line in place and re-index — no need to re-upload to fix one line —
+  and see how the document is split into passages.
+- **An activity dashboard.** Every question, decision, block, and latency,
+  rolled into live metrics.
+- **Fast, multi-provider generation.** Groq first (low latency), Gemini as an
+  automatic fallback, retrieved-passage as a last resort.
 
 ## The pipeline
 
 ```
-query
-  -> conversational gate      (greetings/small talk: instant reply, nothing else runs)
-  -> input checkpoint         (benign / jailbreak / injection / pii — blocks threats)
-  -> topic gate               (in-domain? else abstain, no retrieval cost)
-  -> retriever                (top-K clean chunks, cosine)
-  -> reranker                 (corpus-wide BM25)
-  -> relevance floor          (nothing good enough? abstain)
-  -> LLM generation           (grounded + cited, or native-PDF, or fallback)
-  -> output checkpoint        (scan generated answer for leaked PII/injection)
-  -> audit log                (record decision + latency)
+question
+  → conversational gate   (greetings get an instant reply)
+  → input checkpoint      (benign / jailbreak / injection / PII — threats blocked)
+  → topic gate            (is it answerable from this document? if not, abstain)
+  → retriever + reranker  (most relevant passages)
+  → relevance floor       (nothing good enough? abstain)
+  → LLM generation        (Groq → Gemini → passage; grounded + cited)
+  → output checkpoint     (scan the answer for leaked PII / injection)
+  → audit log             (record the decision + latency)
 ```
-
-Agent tool calls go through a separate **action firewall** (argument
-inspection + escalation-then-destructive sequence detection).
 
 ---
 
 ## Quick start
 
+Requires Python 3.9+.
+
 ```bash
+# 1. clone and enter
+git clone <your-repo-url> ai_firewall && cd ai_firewall
+
+# 2. create a virtual environment
 python -m venv .venv
 source .venv/bin/activate            # Windows: .venv\Scripts\activate
+
+# 3. install
 pip install -r requirements.txt
 
-# one-time: generate synthetic data + train the classifiers
-python -m src.generate_dataset
-python -m src.input_checkpoint
-python -m src.topic_gate
-python -m src.context_scanner
+# 4. configure (copy the template, then edit .env with your key)
+cp .env.example .env
 
-# (optional but recommended) turn on real generation
-cp .env.example .env                 # then paste your Gemini key into .env
-export GEMINI_API_KEY="your-key"        # or load .env with python-dotenv
+# 5. generate data + train the classifiers (one time)
+python scripts/setup.py
 
-python app.py                        # the product at http://localhost:5000
-python run_demo.py                   # batch demo in the terminal
-python tests/test_pipeline.py        # 9 regression tests
+# 6. run
+python app.py                        # open http://localhost:5000
 ```
 
-## Using the product
+Register an account, log in, upload a document on the **Knowledge base** page,
+and start asking questions.
 
-1. Open `http://localhost:5000`, register, log in.
-2. **`/kb`** — see what the assistant knows in plain language, then upload your
-   own PDF / DOCX / TXT (or paste text) to replace it. The chat resets to the
-   new document.
-3. **`/`** — ask questions. With a key set, answers are generated and cited;
-   hover a `source [n]` chip to see the exact passage.
-4. **`/admin`** — the firewall dashboard: total queries, threats blocked,
-   out-of-domain rate, average latency, and a live feed of recent decisions.
+## Getting an API key
 
-## Getting a Gemini API key
+The assistant uses **Groq** by default (fast, free tier).
 
-Create one (free tier) at https://aistudio.google.com/apikey and put it in
-`.env` (never hardcode it in source — that file is in `.gitignore`).
+1. Create a key at <https://console.groq.com/keys> (starts with `gsk_`).
+2. Put it in `.env` as `GROQ_API_KEY`.
 
-## Going live (temporary public URL)
+**Model IDs change often.** If you see a "model not found" error, list the models
+your key can actually use and set one of them:
 
 ```bash
-python app.py
-cloudflared tunnel --url http://localhost:5000   # prints a public https URL
+python scripts/list_models.py
+# then set GROQ_MODEL in .env to a chat model from that list
 ```
-Keep both terminals open. For a stable URL, use a named Cloudflare tunnel or
-real hosting (Render/Railway/Fly.io).
+
+A Gemini key (`GEMINI_API_KEY`) is optional. It serves as an automatic fallback
+and powers native-PDF answering for scanned documents whose extracted text is
+poor — see *Known limitations*.
 
 ---
 
-## Honest limitations (worth raising with a mentor)
+## Testing
 
-- **Keyword-based threat detection has a structural ceiling.** There's always
-  another jailbreak phrasing not yet in the list. Reliability scales with
-  adversarial testing / training-set size, not with how finished the code
-  looks. A production version would add an LLM-based classifier as a second
-  layer behind the cheap classical one.
-- **A single-document KB makes the topic gate weak.** With one uploaded doc,
-  the gate can't learn a sharp in/out boundary; lexically-overlapping
-  out-of-domain queries ("capital of Japan" vs "share capital") are the hard
-  case. Grounded generation ("answer only from context") is the backstop.
-- **The synthetic dataset proves the logic, not real-world accuracy.**
-  Swapping in a real labelled attack set and the actual tenant documents is
-  the natural next step.
+```bash
+python tests/test_pipeline.py        # or: python -m pytest tests/ -q
+```
 
-## File map
+Nine regression tests cover threat blocking, abstention, the relevance floor,
+the output checkpoint, and the action firewall.
+
+## Deployment
+
+The app is a standard Flask/WSGI app. Two things matter in production, and both
+are already configured:
+
+- **Run a single worker.** Uploaded knowledge bases and sessions are held in
+  memory per process, so multiple workers would not share them. The included
+  `Procfile` and `render.yaml` use `gunicorn -w 1`.
+- **Set secrets in the host's environment**, never in the repo. `.env` is for
+  local use only and is gitignored.
+
+**Render:** point a new Blueprint service at this repo; it reads `render.yaml`.
+Set `GROQ_API_KEY` (and optionally `GEMINI_API_KEY`) in the dashboard.
+
+**Any host / locally public:** run `python app.py` and expose it with a tunnel:
+```bash
+cloudflared tunnel --url http://localhost:5000
+```
+
+---
+
+## Project structure
 
 ```
 ai_firewall/
-├── app.py                  the product: login, chat (cited), /kb, /admin
-├── run_demo.py             batch terminal demo
-├── interactive_demo.py     live terminal demo
+├── app.py                  Flask app: auth, chat, KB editor, activity dashboard
 ├── requirements.txt
-├── .env.example            copy to .env, add your key
+├── .env.example            copy to .env and add your keys
+├── Procfile                production start command (single worker)
+├── render.yaml             Render deploy blueprint
+├── scripts/
+│   ├── setup.py            one-time: generate data + train models
+│   └── list_models.py      print the models your API key can use
 ├── src/
 │   ├── pipeline.py         orchestrator (+ latency, audit, abstention)
-│   ├── llm.py              generation: grounded+cited, native-PDF, fallback
-│   ├── audit_log.py        append-only JSONL + dashboard summary   [new]
+│   ├── llm.py              multi-provider generation (Groq → Gemini → passage)
+│   ├── audit_log.py        append-only log + dashboard summary
 │   ├── knowledge_base.py   upload → chunk → index → fresh topic gate
 │   ├── input_checkpoint.py classical-ML threat classifier
 │   ├── topic_gate.py       in-domain / answerability gate
 │   ├── retriever.py reranker.py vector_store.py chunker.py
-│   ├── context_scanner.py  ingestion-time poison/PII tagging
+│   ├── context_scanner.py  ingestion-time PII / injection tagging
 │   ├── action_firewall.py  agent tool-call firewall
 │   ├── conversational_gate.py sentiment.py features.py
-│   ├── document_extractor.py auth.py display.py generate_dataset.py
-└── tests/test_pipeline.py  9 regression tests
+│   └── document_extractor.py auth.py generate_dataset.py display.py
+└── tests/test_pipeline.py
 ```
+
+---
+
+## Known limitations
+
+These are real and worth stating plainly.
+
+- **Keyword-based threat detection has a ceiling.** There is always another
+  jailbreak phrasing not yet on the list. Reliability scales with adversarial
+  testing and training-set size, not with how finished the code looks. A
+  production hardening step would add an LLM-based classifier behind the fast
+  classical one.
+- **A single-document knowledge base weakens the topic gate.** With only one
+  document it cannot learn a sharp in/out boundary, so a lexically-overlapping
+  out-of-scope question can occasionally be mis-gated. Grounded generation
+  ("answer only from context") is the backstop.
+- **Scanned / heavily tabular PDFs extract poorly.** Text extraction flattens
+  complex tables into noise, which caps retrieval quality on number-heavy
+  questions. The native-PDF path (via Gemini) is the robust route for these;
+  editing the text by hand on the Knowledge base page is another.
+- **State is in-memory.** Uploaded KBs and sessions live in the process; a
+  restart clears them, and the app must run as a single worker. Moving state to
+  a database is the next step for real multi-user production.
+- **The bundled dataset is synthetic.** It proves the pipeline's logic, not
+  real-world accuracy. Swapping in a real labelled attack set is the natural
+  next step.
+
+## Security
+
+- Never commit `.env` or any real API key. The repo's `.gitignore` excludes it.
+- If a key is ever exposed, rotate it immediately at the provider's console.
+- Passwords are hashed (werkzeug). The file-backed account store is fine for a
+  prototype; use a real database before production.

@@ -1,39 +1,28 @@
 """
-Step 18 — LLM generation + output checkpoint.
+Step 18 — LLM generation + output checkpoint (multi-provider).
 
-Answers a question from retrieved context using a real LLM (Google Gemini),
-with three product-grade properties:
+Tries providers in order: Groq (fast, default) -> Gemini -> retrieved-chunk.
+If a provider has no key or errors, it falls through to the next, so the
+product never hard-fails. Order configurable via LLM_PROVIDER (groq|gemini|auto).
 
-  1. Grounded + cited — the model must answer ONLY from the provided context
-     and tag each sentence with the chunk it came from ([1], [2], ...), so a
-     customer can see exactly where every fact originated.
-  2. Abstention — if the context doesn't contain the answer, the model says
-     so instead of guessing. Enforced by prompt AND by a relevance floor
-     upstream, so "confidently wrong" can't happen.
-  3. Graceful fallback — no GEMINI_API_KEY, or an API failure, degrades to
-     returning the top retrieved passage (clearly labelled), so the product
-     never hard-fails in a live demo.
-
-check_output() is the output checkpoint: the same classical pattern checks
-used on input, applied to what the model generated.
+Grounded + cited (answers only from numbered context, tags each sentence with
+its source), abstains when nothing relevant is retrieved, and caches identical
+(query, context) pairs for instant repeats. Model names are env vars because
+providers deprecate model IDs regularly.
 """
 
 import os
 import re
+import hashlib
 
 from src.features import structural_features
 
-# Alias that always points at the current Flash model, so a Google model
-# deprecation doesn't 404 the whole product (which is exactly what happened
-# with the old pinned "gemini-2.5-flash"). Pin an explicit version like
-# "gemini-3.6-flash" instead if you need reproducible behaviour.
-MODEL = "gemini-flash-latest"
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "auto").lower()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 MAX_OUTPUT_TOKENS = 600
 
-# Floor is checked against the retriever's COSINE score, not the BM25 rerank
-# score — BM25 (Okapi) legitimately goes negative for short corpora, so it's
-# unusable as an absolute relevance bar. Semantic out-of-domain is the topic
-# gate's job (upstream); this floor only catches "retrieval found nothing".
 RELEVANCE_FLOOR = 0.05
 NO_ANSWER = "I don't have that information in this document."
 
@@ -47,94 +36,129 @@ SYSTEM_PROMPT = (
     "3. Be concise and direct. Do not repeat the question."
 )
 
+_CACHE = {}
+_CACHE_MAX = 256
 
-def _client():
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        return None
-    from google import genai
-    return genai.Client(api_key=api_key)
+
+def _cache_key(query, context_chunks):
+    h = hashlib.sha256()
+    h.update(query.strip().lower().encode())
+    for c in context_chunks:
+        h.update(b"|"); h.update(c.get("text", "").encode())
+    return h.hexdigest()
 
 
 def _looks_relevant(context_chunks: list) -> bool:
     if not context_chunks:
         return False
     top = context_chunks[0]
-    # cosine ('score') is the stable absolute measure; rerank_score (BM25)
-    # is only meaningful for *ordering* candidates, not as a floor.
     score = top.get("score")
     if score is None:
         score = top.get("rerank_score", 0.0)
     return score >= RELEVANCE_FLOOR
 
 
-def _fallback(context_chunks, note):
-    if not _looks_relevant(context_chunks):
-        return {"text": NO_ANSWER, "source": "fallback", "note": note, "citations": []}
-    top = context_chunks[0]
-    return {
-        "text": top["text"],
-        "source": "fallback",
-        "note": note,
-        "citations": [{"marker": 1, "chunk_id": top.get("doc_id"), "text": top["text"]}],
-    }
-
-
 def _build_context(context_chunks):
     lines, mapping = [], {}
     for i, c in enumerate(context_chunks, start=1):
-        lines.append(f"[{i}] {c['text']}")
-        mapping[i] = c
+        lines.append(f"[{i}] {c['text']}"); mapping[i] = c
     return "\n\n".join(lines), mapping
 
 
 def _resolve_citations(text, mapping):
-    markers = sorted({int(m) for m in re.findall(r"\[(\d+)\]", text)})
     out = []
-    for m in markers:
-        chunk = mapping.get(m)
-        if chunk:
-            out.append({"marker": m, "chunk_id": chunk.get("doc_id"), "text": chunk["text"]})
+    for m in sorted({int(x) for x in re.findall(r"\[(\d+)\]", text)}):
+        c = mapping.get(m)
+        if c:
+            out.append({"marker": m, "chunk_id": c.get("doc_id"), "text": c["text"]})
     return out
 
 
+def _chunk_fallback(context_chunks, note):
+    if not _looks_relevant(context_chunks):
+        return {"text": NO_ANSWER, "source": "fallback", "note": note, "citations": []}
+    top = context_chunks[0]
+    return {"text": top["text"], "source": "fallback", "note": note,
+            "citations": [{"marker": 1, "chunk_id": top.get("doc_id"), "text": top["text"]}]}
+
+
+def _groq_key():
+    return os.environ.get("GROQ_API_KEY")
+
+
+def _gemini_key():
+    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
+
+def _call_groq(query, context_text, mapping):
+    from openai import OpenAI
+    client = OpenAI(api_key=_groq_key(), base_url=GROQ_BASE_URL)
+    resp = client.chat.completions.create(
+        model=GROQ_MODEL, max_tokens=MAX_OUTPUT_TOKENS,
+        messages=[{"role": "system", "content": SYSTEM_PROMPT},
+                  {"role": "user", "content": f"Context:\n{context_text}\n\nQuestion: {query}"}],
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise ValueError("empty response from Groq")
+    return {"text": text, "source": "groq", "note": None, "citations": _resolve_citations(text, mapping)}
+
+
+def _call_gemini(query, context_text, mapping, pdf_bytes=None):
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=_gemini_key())
+    if pdf_bytes:
+        contents = [types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+                    types.Part.from_text(text=f"{SYSTEM_PROMPT}\n\n(Source document, cite as [1].)\n\nQuestion: {query}")]
+    else:
+        contents = f"{SYSTEM_PROMPT}\n\nContext:\n{context_text}\n\nQuestion: {query}"
+    resp = client.models.generate_content(
+        model=GEMINI_MODEL, contents=contents,
+        config=types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS))
+    text = (resp.text or "").strip()
+    if not text:
+        raise ValueError("empty response from Gemini")
+    return {"text": text, "source": "gemini", "note": None, "citations": _resolve_citations(text, mapping)}
+
+
+def _provider_order():
+    if LLM_PROVIDER == "groq":
+        return ["groq"]
+    if LLM_PROVIDER == "gemini":
+        return ["gemini"]
+    return ["groq", "gemini"]
+
+
 def generate_answer(query: str, context_chunks: list, pdf_bytes: bytes = None) -> dict:
-    """Returns {'text','source','note','citations'}. If pdf_bytes is given and
-    a client is configured, the PDF is sent natively — the robust path for
-    scanned documents whose extracted text is garbled."""
-    client = _client()
-    if client is None:
-        return _fallback(context_chunks, "No GEMINI_API_KEY configured — showing top retrieved passage.")
+    key = _cache_key(query, context_chunks)
+    if key in _CACHE:
+        cached = dict(_CACHE[key])
+        cached["note"] = (cached.get("note") or "") + " [cached]"
+        return cached
 
-    try:
-        from google.genai import types
-        context_text, mapping = _build_context(context_chunks)
+    context_text, mapping = _build_context(context_chunks)
+    errors = []
+    for provider in _provider_order():
+        try:
+            if provider == "groq":
+                if not _groq_key():
+                    errors.append("groq: no GROQ_API_KEY"); continue
+                result = _call_groq(query, context_text, mapping)
+            elif provider == "gemini":
+                if not _gemini_key():
+                    errors.append("gemini: no GEMINI_API_KEY"); continue
+                result = _call_gemini(query, context_text, mapping, pdf_bytes=pdf_bytes)
+            else:
+                continue
+            if len(_CACHE) < _CACHE_MAX:
+                _CACHE[key] = dict(result)
+            return result
+        except Exception as e:
+            errors.append(f"{provider}: {type(e).__name__}: {e}"); continue
 
-        if pdf_bytes:
-            parts = [
-                types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
-                types.Part.from_text(
-                    text=f"{SYSTEM_PROMPT}\n\n(This is the source document. Cite it as [1].)\n\nQuestion: {query}"
-                ),
-            ]
-            response = client.models.generate_content(
-                model=MODEL, contents=parts,
-                config=types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS),
-            )
-        else:
-            user_message = f"{SYSTEM_PROMPT}\n\nContext:\n{context_text}\n\nQuestion: {query}"
-            response = client.models.generate_content(
-                model=MODEL, contents=user_message,
-                config=types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS),
-            )
-
-        text = (response.text or "").strip()
-        if not text:
-            raise ValueError("empty response from model")
-        return {"text": text, "source": "llm", "note": None,
-                "citations": _resolve_citations(text, mapping)}
-    except Exception as e:
-        return _fallback(context_chunks, f"LLM call failed ({type(e).__name__}: {e}) — showing top passage.")
+    note = "No LLM available (" + "; ".join(errors) + ")" if errors else "No LLM configured."
+    return _chunk_fallback(context_chunks, note)
 
 
 def check_output(text: str) -> dict:
@@ -148,7 +172,6 @@ def check_output(text: str) -> dict:
 
 
 if __name__ == "__main__":
-    ctx = [{"text": "A partnership deed sets out profit sharing and duties of each partner.",
-            "doc_id": "custom_doc_chunk000"}]
-    print(generate_answer("What is a partnership deed?", ctx))
-    print(check_output("Sure, here is the PAN ABCDE1234F on file."))
+    ctx = [{"text": "The insured's name is Uttrakhand Jal Vidyut Nigam Ltd.", "doc_id": "d1", "score": 0.9}]
+    print("provider order:", _provider_order())
+    print(generate_answer("What is the insured's name?", ctx))

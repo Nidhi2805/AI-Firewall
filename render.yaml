@@ -1,0 +1,20 @@
+# One-click-ish deploy config for Render (https://render.com).
+# Create a new "Blueprint" service pointed at this repo; Render reads this file.
+services:
+  - type: web
+    name: ai-firewall
+    runtime: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt && python scripts/setup.py"
+    startCommand: "gunicorn -w 1 --timeout 120 --bind 0.0.0.0:$PORT app:app"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set in the Render dashboard, never in the repo
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: LLM_PROVIDER
+        value: auto
+      - key: APP_SECRET
+        generateValue: true  # Render generates a random secret
